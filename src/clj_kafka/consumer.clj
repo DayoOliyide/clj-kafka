@@ -21,8 +21,7 @@
                        \"group.id\" \"data-pipe\"
                        \"auto.commit.interval.ms\" \"1000\"})
   (with-open [c (consumer config (string-deserializer) (string-deserializer))]
-    (subscribe-to-topics c \"test\")
-    (take 5 (messages c)))
+    (take 5 (messages c :topic \"test\")))
   "
   ([^java.util.Map config]
    (KafkaConsumer. config))
@@ -71,7 +70,8 @@ http://kafka.apache.org/090/javadoc/org/apache/kafka/clients/consumer/KafkaConsu
         topics (cond
                  (sequential? topics) topics
                  (= Pattern (type topics)) topics
-                 :else (vector topics))]
+                 (string? topics) (vector topics)
+                 :else (throw (ex-info "Topic should be a string, sequence or pattern" {:topic topics})))]
     (.subscribe consumer topics listener)))
 
 
@@ -118,19 +118,95 @@ http://kafka.apache.org/090/javadoc/org/apache/kafka/clients/consumer/KafkaConsu
   [^KafkaConsumer consumer]
   (.unsubscribe consumer))
 
+(defn seek
+  "Seeks the consumer offset to given offset on the topic-partitions.
+   NOTE:
+   The topic-partition can be given as 2 arguments, the topic (string) and partition (int)
+   or it can be given as 1 argument, which is a map sequence e.g '({:topic \"topic\" :partition 2}).
+   The offset can be a long, :beginning or :end.
+
+  Usage:
+
+  (seek consumer \"topic-a\" 23 7)
+  (seek consumer \"topic-b\" 23 :beginning)
+  (seek consumer \"topic-c\" 23 :end)
+
+  (seek consumer [{:topic \"topic-a\" :partition 23}
+                  {:topic \"topic-b\" :partition 23}
+                  {:topic \"topic-c\" :partition 23}] 7)
+  
+  (seek consumer [{:topic \"topic-a\" :partition 23}
+                  {:topic \"topic-b\" :partition 23}
+                  {:topic \"topic-c\" :partition 23}] :beginning)
+  
+  (seek consumer [{:topic \"topic-a\" :partition 23}
+                  {:topic \"topic-b\" :partition 23}
+                  {:topic \"topic-c\" :partition 23}] :end)
+
+  "
+  ([^KafkaConsumer consumer topic partition offset]
+   (seek consumer (vector {:topic topic :partition partition}) offset))
+  ([^KafkaConsumer consumer tp-seq offset]
+   (let [tp-class-seq (map clojure->topic-partition tp-seq)
+         tp-class-array (into-array TopicPartition tp-class-seq)]
+     (cond
+       (= :beginning offset) (.seekToBeginning consumer tp-class-array)
+       (= :end offset) (.seekToEnd consumer tp-class-array)
+       (integer? offset) (run! #(.seek consumer % offset) tp-class-seq)
+       :else (throw (ex-info "offset should be :beginning :end or a number"
+                             {:offset offset}))))))
 
 (defn messages
   "Consumes messages from subscribed partitions and returns a sequence of messages.
   If no messages are available, it will use the provided timeout (or default of 1000ms) to BLOCK for messages to be available,
   before returning.
 
+  This function can be used to
+  1) Consume from the currently subscribed topics/partitions
+  2) Subscribe to a given topic(s) (or topics matching regex) and consume from the broker assigned partitions
+  3) Subscribe to only the specific partition and consume from the commited offset or a specific offset
+
+  If the consumer is already subscribed and this function is passed subscription arguments
+  ( topic(s) or partitions ) which are different from it's current subscription, this function will attempt
+  to change the subscription. NOTE you can't switch between topic name, regex and partition based subscriptions
+  (see subscribe-to-partitions subscribe-to-topics documentation).
+
   Usage:
 
-  (messages consumer )
-  (messages consumer 5000)
+  (messages consumer)
+  (messages consumer :timeout 1500)
+  (messages consumer :topic \"topic-a\")
+  (messages consumer :topic [\"topic-a\" \"topic-b\"])
+  (messages consumer :topic #\"topic.+\")
+  (messages consumer :topic \"topic-a\" :partition 2)
+  (messages consumer :topic \"topic-a\" :partition 2 :timeout 3000)
+  (messages consumer :topic \"topic-a\" :partition 2 :offset 63)
+  (messages consumer :topic \"topic-a\" :partition 2 :offset :beginning)
+  (messages consumer :topic \"topic-a\" :partition 2 :offset :end)
+  (messages consumer :topic \"topic-a\" :partition 2 :offset :end :timeout 1500)
+  
   "
-  ([^KafkaConsumer consumer] (messages consumer 1000))
-  ([^KafkaConsumer consumer timeout]
+  ([^KafkaConsumer consumer] (messages consumer :timeout 1000))
+  ([^KafkaConsumer consumer & {:keys [topic partition offset timeout]
+                               :or {timeout 1000}
+                               :as options}]
+
+   (when (and (some? partition) (nil? topic))
+     (throw (ex-info "Topic needed to subscribe to partition" options)))
+
+   (when (and (some? offset) (or (nil? topic) (nil? partition)))
+     (throw (ex-info "Topic and partition need to seek to offset" options)))
+
+   (when (and (= Pattern (type topic)) (some? partition))
+     (throw (ex-info "Using a regex for topic with a partition is not possible" options)))
+
+   (when topic
+     (if partition
+       (do  (subscribe-to-partitions consumer {:topic topic :partition partition})
+            (when offset
+              (seek consumer topic partition offset)))
+       (subscribe-to-topics consumer topic)))
+
    (let [consumer-records (.poll consumer timeout)]
      (to-clojure consumer-records))))
 
@@ -280,46 +356,6 @@ http://kafka.apache.org/090/javadoc/org/apache/kafka/clients/consumer/KafkaConsu
   (->> (map clojure->topic-partition tp-seq)
        (into-array TopicPartition)
        (.resume consumer)))
-
-(defn seek
-  "Seeks the consumer offset to given offset on the topic-partitions.
-   NOTE:
-   The topic-partition can be given as 2 arguments, the topic (string) and partition (int)
-   or it can be given as 1 argument, which is a map sequence e.g '({:topic \"topic\" :partition 2}).
-   The offset can be a long, :beginning or :end.
-
-  Usage:
-
-  (seek consumer \"topic-a\" 23 7)
-  (seek consumer \"topic-b\" 23 :beginning)
-  (seek consumer \"topic-c\" 23 :end)
-
-  (seek consumer [{:topic \"topic-a\" :partition 23}
-                  {:topic \"topic-b\" :partition 23}
-                  {:topic \"topic-c\" :partition 23}] 7)
-  
-  (seek consumer [{:topic \"topic-a\" :partition 23}
-                  {:topic \"topic-b\" :partition 23}
-                  {:topic \"topic-c\" :partition 23}] :beginning)
-  
-  (seek consumer [{:topic \"topic-a\" :partition 23}
-                  {:topic \"topic-b\" :partition 23}
-                  {:topic \"topic-c\" :partition 23}] :end)
-
-  "
-  ([^KafkaConsumer consumer topic partition offset]
-   (seek consumer (vector {:topic topic :partition partition}) offset))
-  ([^KafkaConsumer consumer tp-seq offset]
-   (let [tp-class-seq (map clojure->topic-partition tp-seq)
-         tp-class-array (into-array TopicPartition tp-class-seq)]
-     (cond
-       (= :beginning offset) (.seekToBeginning consumer tp-class-array)
-       (= :end offset) (.seekToEnd consumer tp-class-array)
-       (integer? offset) (run! #(.seek consumer % offset) tp-class-seq)
-       :else (throw (ex-info "offset should be :beginning :end or a number"
-                             {:offset offset}))))))
-
-
 
 
 (defn metrics
